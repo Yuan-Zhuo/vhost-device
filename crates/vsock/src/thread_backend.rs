@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    convert::TryInto,
     os::unix::{
         net::UnixStream,
         prelude::{AsRawFd, RawFd},
@@ -15,9 +16,14 @@ use vm_memory::bitmap::BitmapSlice;
 
 use crate::{
     rxops::*,
+    tsi::{
+        proxy::{tcp::TcpProxy, udp::UdpProxy, Proxy, ProxyID},
+        response::{init_proxy_pkt, ConnectResult, ListenResult},
+        write_le_i32, TsiRequest, TsiRespOp, TsiResponse, PROXY_PORT, SOCK_DGRAM, SOCK_STREAM,
+    },
     vhu_vsock::{
         CidMap, ConnMapKey, Error, Result, VSOCK_HOST_CID, VSOCK_OP_REQUEST, VSOCK_OP_RST,
-        VSOCK_TYPE_STREAM,
+        VSOCK_TYPE_DGRAM, VSOCK_TYPE_STREAM,
     },
     vhu_vsock_thread::VhostUserVsockThread,
     vsock_conn::*,
@@ -58,7 +64,9 @@ pub(crate) struct VsockThreadBackend {
     /// Host side socket for listening to new connections from the host.
     host_socket_path: String,
     /// epoll for registering new host-side connections.
-    epoll_fd: i32,
+    epoll_fd: RawFd,
+    /// epoll for registering new host-side proxy.
+    proxy_event_fd: RawFd,
     /// CID of the guest.
     guest_cid: u64,
     /// Set of allocated local ports.
@@ -68,6 +76,12 @@ pub(crate) struct VsockThreadBackend {
     cid_map: Arc<RwLock<CidMap>>,
     /// Queue of raw vsock packets recieved from sibling VMs to be sent to the guest.
     raw_pkts_queue: VecDeque<RawVsockPacket>,
+    /// Map of ProxyID objects indexed by raw file descriptors.
+    pub proxy_fd_map: HashMap<RawFd, ProxyID>,
+    /// Maps the port numbers of both parties to a proxy. Used for TSI.
+    pub proxy_map: HashMap<ProxyID, Box<dyn Proxy>>,
+    /// Queue of ProxyID objects indicating pending rx operations.
+    proxy_rxq: VecDeque<ProxyID>,
 }
 
 impl VsockThreadBackend {
@@ -75,6 +89,7 @@ impl VsockThreadBackend {
     pub fn new(
         host_socket_path: String,
         epoll_fd: i32,
+        proxy_event_fd: i32,
         guest_cid: u64,
         tx_buffer_size: u32,
         cid_map: Arc<RwLock<CidMap>>,
@@ -88,11 +103,15 @@ impl VsockThreadBackend {
             stream_map: HashMap::new(),
             host_socket_path,
             epoll_fd,
+            proxy_event_fd,
             guest_cid,
             local_port_set: HashSet::new(),
             tx_buffer_size,
             cid_map,
             raw_pkts_queue: VecDeque::new(),
+            proxy_fd_map: HashMap::new(),
+            proxy_map: HashMap::new(),
+            proxy_rxq: VecDeque::new(),
         }
     }
 
@@ -104,6 +123,11 @@ impl VsockThreadBackend {
     /// Checks if there are pending raw vsock packets to be sent to the guest.
     pub fn pending_raw_pkts(&self) -> bool {
         !self.raw_pkts_queue.is_empty()
+    }
+
+    /// Checks if there are pending raw vsock packets to be sent to the guest.
+    pub fn pending_proxy_rx(&self) -> bool {
+        !self.proxy_rxq.is_empty()
     }
 
     /// Deliver a vsock packet to the guest vsock driver.
@@ -174,6 +198,12 @@ impl VsockThreadBackend {
             return Ok(());
         }
 
+        info!(
+            "SNOOPY: send_pkt: src_port: {} dst_port: {}",
+            pkt.src_port(),
+            pkt.dst_port()
+        );
+
         let dst_cid = pkt.dst_cid();
         if dst_cid != VSOCK_HOST_CID {
             let cid_map = self.cid_map.read().unwrap();
@@ -194,53 +224,160 @@ impl VsockThreadBackend {
         }
 
         // TODO: Rst if packet has unsupported type
-        if pkt.type_() != VSOCK_TYPE_STREAM {
-            info!("vsock: dropping packet of unknown type");
-            return Ok(());
-        }
+        match pkt.type_() {
+            VSOCK_TYPE_STREAM => {
+                let key = ConnMapKey::new(pkt.dst_port(), pkt.src_port());
 
-        let key = ConnMapKey::new(pkt.dst_port(), pkt.src_port());
+                // TODO: Handle cases where connection does not exist and packet op
+                // is not VSOCK_OP_REQUEST
+                if !self.conn_map.contains_key(&key) {
+                    // The packet contains a new connection request
+                    if pkt.op() == VSOCK_OP_REQUEST {
+                        self.handle_new_guest_conn(pkt);
+                    } else {
+                        // TODO: send back RST
+                    }
+                    return Ok(());
+                }
 
-        // TODO: Handle cases where connection does not exist and packet op
-        // is not VSOCK_OP_REQUEST
-        if !self.conn_map.contains_key(&key) {
-            // The packet contains a new connection request
-            if pkt.op() == VSOCK_OP_REQUEST {
-                self.handle_new_guest_conn(pkt);
-            } else {
-                // TODO: send back RST
+                if pkt.op() == VSOCK_OP_RST {
+                    // Handle an RST packet from the guest here
+                    let conn = self.conn_map.get(&key).unwrap();
+                    if conn.rx_queue.contains(RxOps::Reset.bitmask()) {
+                        return Ok(());
+                    }
+                    let conn = self.conn_map.remove(&key).unwrap();
+                    self.listener_map.remove(&conn.stream.as_raw_fd());
+                    self.stream_map.remove(&conn.stream.as_raw_fd());
+                    self.local_port_set.remove(&conn.local_port);
+                    VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
+                        .unwrap_or_else(|err| {
+                            warn!(
+                                "Could not remove epoll listener for fd {:?}: {:?}",
+                                conn.stream.as_raw_fd(),
+                                err
+                            )
+                        });
+                    return Ok(());
+                }
+
+                // Forward this packet to its listening connection
+                let conn = self.conn_map.get_mut(&key).unwrap();
+                conn.send_pkt(pkt)?;
+
+                if conn.rx_queue.pending_rx() {
+                    // Required if the connection object adds new rx operations
+                    self.backend_rxq.push_back(key);
+                }
             }
-            return Ok(());
-        }
+            VSOCK_TYPE_DGRAM => {
+                let tsi_req = pkt.try_into()?;
 
-        if pkt.op() == VSOCK_OP_RST {
-            // Handle an RST packet from the guest here
-            let conn = self.conn_map.get(&key).unwrap();
-            if conn.rx_queue.contains(RxOps::Reset.bitmask()) {
-                return Ok(());
+                info!("SNOOPY tsi_request: {:?}", tsi_req);
+
+                match tsi_req {
+                    TsiRequest::PorxyCreate(proxy_create_config) => {
+                        match proxy_create_config.type_ {
+                            SOCK_STREAM => {
+                                let tcp_proxy = TcpProxy::new(ProxyID::new(
+                                    self.guest_cid,
+                                    proxy_create_config.peer_port,
+                                    PROXY_PORT,
+                                ))
+                                .map_err(|e| Error::UnixCreate(e.into()))?;
+
+                                self.proxy_fd_map
+                                    .insert(tcp_proxy.fd, tcp_proxy.id().clone());
+
+                                self.proxy_map
+                                    .insert(tcp_proxy.id().clone(), Box::new(tcp_proxy));
+                            }
+                            SOCK_DGRAM => {
+                                let udp_proxy = UdpProxy::new(ProxyID::new(
+                                    self.guest_cid,
+                                    proxy_create_config.peer_port,
+                                    PROXY_PORT,
+                                ))
+                                .map_err(|e| Error::UnixCreate(e.into()))?;
+
+                                self.proxy_fd_map
+                                    .insert(udp_proxy.fd, udp_proxy.id().clone());
+
+                                self.proxy_map
+                                    .insert(udp_proxy.id().clone(), Box::new(udp_proxy));
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    TsiRequest::Connect(connect_config) => {
+                        let mut connect_result = ConnectResult {
+                            src_port: pkt.dst_port(),
+                            dst_port: pkt.src_port(),
+                            result: 0,
+                        };
+
+                        let id: ProxyID =
+                            ProxyID::new(self.guest_cid, connect_config.peer_port, PROXY_PORT);
+
+                        let proxy = self.proxy_map.get_mut(&id).ok_or(Error::ProxyNotFound)?;
+
+                        match proxy.connect(connect_config) {
+                            Ok(_) => {
+                                info!("SNOOPY proxy connected");
+
+                                // register the connected proxy fd if success
+                                // only care about events indicating that the listening proxy is available for read
+                                VhostUserVsockThread::epoll_register(
+                                    self.proxy_event_fd,
+                                    proxy.as_raw_fd(),
+                                    epoll::Events::EPOLLIN,
+                                )?;
+                            }
+                            Err(errno) => {
+                                info!("SNOOPY proxy connect error: {}", errno);
+
+                                connect_result.result = -(errno as i32);
+                            }
+                        };
+
+                        // connect request requires a reply
+                        proxy
+                            .resp_queue()
+                            .push_back(TsiResponse::Connect(connect_result));
+                        self.proxy_rxq.push_back(id);
+                    }
+                    TsiRequest::Getname(_) => todo!(),
+                    TsiRequest::SendtoAddr(_) => todo!(),
+                    TsiRequest::SendtoData => todo!(),
+                    TsiRequest::Listen(listen_config) => {
+                        let mut listen_result = ListenResult {
+                            src_port: pkt.dst_port(),
+                            dst_port: pkt.src_port(),
+                            result: 0,
+                        };
+
+                        let id: ProxyID =
+                            ProxyID::new(self.guest_cid, listen_config.peer_port, PROXY_PORT);
+
+                        let proxy = self.proxy_map.get_mut(&id).ok_or(Error::ProxyNotFound)?;
+
+                        if let Err(errno) = proxy.listen(listen_config) {
+                            listen_result.result = -(errno as i32)
+                        };
+
+                        // listen request requires a reply
+                        proxy
+                            .resp_queue()
+                            .push_back(TsiResponse::Listen(listen_result));
+                        self.proxy_rxq.push_back(id);
+                    }
+                    TsiRequest::Accept(_) => todo!(),
+                    TsiRequest::ProxyRelease(_) => {}
+                }
             }
-            let conn = self.conn_map.remove(&key).unwrap();
-            self.listener_map.remove(&conn.stream.as_raw_fd());
-            self.stream_map.remove(&conn.stream.as_raw_fd());
-            self.local_port_set.remove(&conn.local_port);
-            VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
-                .unwrap_or_else(|err| {
-                    warn!(
-                        "Could not remove epoll listener for fd {:?}: {:?}",
-                        conn.stream.as_raw_fd(),
-                        err
-                    )
-                });
-            return Ok(());
-        }
-
-        // Forward this packet to its listening connection
-        let conn = self.conn_map.get_mut(&key).unwrap();
-        conn.send_pkt(pkt)?;
-
-        if conn.rx_queue.pending_rx() {
-            // Required if the connection object adds new rx operations
-            self.backend_rxq.push_back(key);
+            _ => {
+                info!("vsock: dropping packet of unknown type: {}", pkt.type_());
+            }
         }
 
         Ok(())
@@ -262,6 +399,54 @@ impl VsockThreadBackend {
             let buf = pkt.data_slice().ok_or(Error::PktBufMissing)?;
             buf.copy_from(&raw_vsock_pkt.data);
         }
+
+        Ok(())
+    }
+
+    pub fn recv_proxy_pkt<B: BitmapSlice>(&mut self, pkt: &mut VsockPacket<B>) -> Result<()> {
+        let id = self.proxy_rxq.pop_front().ok_or(Error::EmptyProxyIDQueue)?;
+        let proxy = self.proxy_map.get_mut(&id).ok_or(Error::ProxyNotFound)?;
+
+        init_proxy_pkt(&id, pkt)?;
+
+        let data_slice = pkt.data_slice().ok_or(Error::PktBufMissing)?;
+
+        let tsi_resp = proxy
+            .resp_queue()
+            .pop_front()
+            .ok_or(Error::EmptyProxyRespQueue)?;
+
+        let mut pkt_len = 0;
+
+        info!("SNOOPY tsi_response: {:?}", tsi_resp);
+
+        match tsi_resp {
+            TsiResponse::Connect(connect_result) => {
+                pkt_len += write_le_i32(data_slice, 0, connect_result.result)?;
+
+                pkt.set_src_port(connect_result.src_port)
+                    .set_dst_port(connect_result.dst_port)
+                    .set_op(TsiRespOp::Rw.into());
+            }
+            TsiResponse::Listen(listen_result) => {
+                write_le_i32(data_slice, 0, listen_result.result)?;
+
+                pkt.set_src_port(listen_result.src_port)
+                    .set_dst_port(listen_result.dst_port)
+                    .set_op(TsiRespOp::Rw.into());
+            }
+            TsiResponse::RecvData => {
+                let mut buffer = Vec::with_capacity(data_slice.len());
+                let read_cnt = proxy
+                    .recv(&mut buffer)
+                    .map_err(|e| Error::UnixRead(e.into()))?;
+                data_slice.copy_from(&buffer[..read_cnt]);
+
+                pkt.set_op(TsiRespOp::Rw.into());
+            }
+        }
+
+        pkt.set_len(pkt_len as u32);
 
         Ok(())
     }
@@ -350,11 +535,14 @@ mod tests {
 
         let epoll_fd = epoll::create(false).unwrap();
 
+        let proxy_epoll_fd = epoll::create(false).unwrap();
+
         let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
 
         let mut vtp = VsockThreadBackend::new(
             vsock_socket_path.display().to_string(),
             epoll_fd,
+            proxy_epoll_fd,
             CID,
             CONN_TX_BUF_SIZE,
             cid_map,
@@ -442,8 +630,15 @@ mod tests {
             .insert(SIBLING_CID, sibling_backend.clone());
 
         let epoll_fd = epoll::create(false).unwrap();
-        let mut vtp =
-            VsockThreadBackend::new(vsock_socket_path, epoll_fd, CID, CONN_TX_BUF_SIZE, cid_map);
+        let proxy_epoll_fd = epoll::create(false).unwrap();
+        let mut vtp = VsockThreadBackend::new(
+            vsock_socket_path,
+            epoll_fd,
+            proxy_epoll_fd,
+            CID,
+            CONN_TX_BUF_SIZE,
+            cid_map,
+        );
 
         assert!(!vtp.pending_raw_pkts());
 

@@ -3,6 +3,7 @@
 mod rxops;
 mod rxqueue;
 mod thread_backend;
+mod tsi;
 mod txbuf;
 mod vhu_vsock;
 mod vhu_vsock_thread;

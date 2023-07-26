@@ -7,7 +7,7 @@ use std::{
     u16, u32, u64, u8,
 };
 
-use log::warn;
+use log::{info, warn};
 use thiserror::Error as ThisError;
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackend, VringRwLock};
@@ -41,11 +41,17 @@ pub(crate) const BACKEND_EVENT: u16 = 3;
 /// Notification coming from the sibling VM.
 pub(crate) const SIBLING_VM_EVENT: u16 = 4;
 
+/// Notification coming from the proxy.
+pub(crate) const PROXY_EVENT: u16 = 5;
+
 /// CID of the host
 pub(crate) const VSOCK_HOST_CID: u64 = 2;
 
 /// Connection oriented packet
 pub(crate) const VSOCK_TYPE_STREAM: u16 = 1;
+
+/// Connectionless packet
+pub(crate) const VSOCK_TYPE_DGRAM: u16 = 3;
 
 /// Vsock packet operation ID
 
@@ -74,11 +80,13 @@ pub(crate) const VSOCK_FLAGS_SHUTDOWN_SEND: u32 = 2;
 // Queue mask to select vrings.
 const QUEUE_MASK: u64 = 0b11;
 
-pub(crate) type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Custom error types
 #[derive(Debug, ThisError)]
-pub(crate) enum Error {
+pub enum Error {
+    #[error("Unknown")]
+    Unknown,
     #[error("Failed to handle event other than EPOLLIN event")]
     HandleEventNotEpollIn,
     #[error("Failed to handle unknown event")]
@@ -87,6 +95,8 @@ pub(crate) enum Error {
     UnixAccept(std::io::Error),
     #[error("Failed to bind a unix stream")]
     UnixBind(std::io::Error),
+    #[error("Failed to listen a unix stream")]
+    UnixListen(std::io::Error),
     #[error("Failed to create an epoll fd")]
     EpollFdCreate(std::io::Error),
     #[error("Failed to add to epoll")]
@@ -115,6 +125,12 @@ pub(crate) enum Error {
     CreateThreadPool(std::io::Error),
     #[error("Packet missing data buffer")]
     PktBufMissing,
+    #[error("Failed to parse config from packet")]
+    InvalidPktBuf,
+    #[error("Failed to create a unix socket")]
+    UnixCreate(std::io::Error),
+    #[error("Failed to get an expected proxy")]
+    ProxyNotFound,
     #[error("Failed to connect to unix socket")]
     UnixConnect(std::io::Error),
     #[error("Unable to write to unix stream")]
@@ -131,6 +147,10 @@ pub(crate) enum Error {
     EventFdCreate(std::io::Error),
     #[error("Raw vsock packets queue is empty")]
     EmptyRawPktsQueue,
+    #[error("ProxyID queue is empty")]
+    EmptyProxyIDQueue,
+    #[error("Proxy Response queue is empty")]
+    EmptyProxyRespQueue,
 }
 
 impl std::convert::From<Error> for std::io::Error {
@@ -256,7 +276,7 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
-        VhostUserProtocolFeatures::CONFIG
+        VhostUserProtocolFeatures::CONFIG | VhostUserProtocolFeatures::MQ
     }
 
     fn set_event_idx(&self, enabled: bool) {
@@ -289,6 +309,11 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
         let mut thread = self.threads[thread_id].lock().unwrap();
         let evt_idx = thread.event_idx;
 
+        info!(
+            "SNOOPY handle_event: device_event: {} evt_idx: {:?}",
+            device_event, evt_idx
+        );
+
         match device_event {
             RX_QUEUE_EVENT => {}
             TX_QUEUE_EVENT => {
@@ -311,14 +336,24 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
                 thread.process_raw_pkts(vring_rx, evt_idx)?;
                 return Ok(false);
             }
+            PROXY_EVENT => {
+                thread.process_proxy_evt(evset);
+            }
             _ => {
                 return Err(Error::HandleUnknownEvent.into());
             }
         }
 
-        if device_event != EVT_QUEUE_EVENT && thread.thread_backend.pending_rx() {
-            thread.process_rx(vring_rx, evt_idx)?;
+        if device_event != EVT_QUEUE_EVENT {
+            if thread.thread_backend.pending_rx() {
+                thread.process_rx(vring_rx, evt_idx)?;
+            }
+            if thread.thread_backend.pending_proxy_rx() {
+                thread.process_proxy_rx(vring_rx, evt_idx)?;
+            }
         }
+
+        info!("SNOOPY handle_event finished");
 
         Ok(false)
     }

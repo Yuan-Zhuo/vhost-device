@@ -14,7 +14,7 @@ use std::{
 };
 
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
-use log::warn;
+use log::{info, warn};
 use vhost_user_backend::{VringEpollHandler, VringRwLock, VringT};
 use virtio_queue::QueueOwnedT;
 use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
@@ -27,9 +27,10 @@ use vmm_sys_util::{
 use crate::{
     rxops::*,
     thread_backend::*,
+    tsi::TsiResponse,
     vhu_vsock::{
-        CidMap, ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT, SIBLING_VM_EVENT,
-        VSOCK_HOST_CID,
+        CidMap, ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT, PROXY_EVENT,
+        SIBLING_VM_EVENT, VSOCK_HOST_CID,
     },
     vsock_conn::*,
 };
@@ -39,7 +40,9 @@ type ArcVhostBknd = Arc<VhostUserVsockBackend>;
 enum RxQueueType {
     Standard,
     RawPkts,
+    ProxyPkts,
 }
+
 pub(crate) struct VhostUserVsockThread {
     /// Guest memory map.
     pub mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
@@ -68,6 +71,8 @@ pub(crate) struct VhostUserVsockThread {
     /// EventFd to notify this thread for custom events. Currently used to notify
     /// this thread to process raw vsock packets sent from a sibling VM.
     pub sibling_event_fd: EventFd,
+    /// proxy event fd for TSI.
+    proxy_epoll_fd: RawFd,
 }
 
 impl VhostUserVsockThread {
@@ -92,6 +97,8 @@ impl VhostUserVsockThread {
 
         let sibling_event_fd = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
 
+        let proxy_epoll_fd = epoll::create(true).map_err(Error::EpollFdCreate)?;
+
         let thread = VhostUserVsockThread {
             mem: None,
             event_idx: false,
@@ -103,6 +110,7 @@ impl VhostUserVsockThread {
             thread_backend: VsockThreadBackend::new(
                 uds_path,
                 epoll_fd,
+                proxy_epoll_fd,
                 guest_cid,
                 tx_buffer_size,
                 cid_map,
@@ -115,6 +123,7 @@ impl VhostUserVsockThread {
             local_port: Wrapping(0),
             tx_buffer_size,
             sibling_event_fd,
+            proxy_epoll_fd,
         };
 
         VhostUserVsockThread::epoll_register(epoll_fd, host_raw_fd, epoll::Events::EPOLLIN)?;
@@ -172,11 +181,13 @@ impl VhostUserVsockThread {
         vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
     ) {
         self.vring_worker = vring_worker;
+
         self.vring_worker
             .as_ref()
             .unwrap()
             .register_listener(self.get_epoll_fd(), EventSet::IN, u64::from(BACKEND_EVENT))
             .unwrap();
+
         self.vring_worker
             .as_ref()
             .unwrap()
@@ -185,6 +196,12 @@ impl VhostUserVsockThread {
                 EventSet::IN,
                 u64::from(SIBLING_VM_EVENT),
             )
+            .unwrap();
+
+        self.vring_worker
+            .as_ref()
+            .unwrap()
+            .register_listener(self.proxy_epoll_fd, EventSet::IN, u64::from(PROXY_EVENT))
             .unwrap();
     }
 
@@ -196,6 +213,30 @@ impl VhostUserVsockThread {
                 Ok(ev_cnt) => {
                     for evt in epoll_events.iter().take(ev_cnt) {
                         self.handle_event(
+                            evt.data as RawFd,
+                            epoll::Events::from_bits(evt.events).unwrap(),
+                        );
+                    }
+                }
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    warn!("failed to consume new epoll event");
+                }
+            }
+            break 'epoll;
+        }
+    }
+
+    /// Process a PROXY_EVENT received by backend proxy.
+    pub fn process_proxy_evt(&mut self, _evset: EventSet) {
+        let mut epoll_events = vec![epoll::Event::new(epoll::Events::empty(), 0); 32];
+        'epoll: loop {
+            match epoll::wait(self.proxy_epoll_fd, 0, epoll_events.as_mut_slice()) {
+                Ok(ev_cnt) => {
+                    for evt in epoll_events.iter().take(ev_cnt) {
+                        self.handle_proxy_event(
                             evt.data as RawFd,
                             epoll::Events::from_bits(evt.events).unwrap(),
                         );
@@ -344,6 +385,21 @@ impl VhostUserVsockThread {
         }
     }
 
+    fn handle_proxy_event(&mut self, fd: RawFd, _evset: epoll::Events) {
+        match self.thread_backend.proxy_fd_map.get(&fd) {
+            Some(id) => {
+                let proxy = self
+                    .thread_backend
+                    .proxy_map
+                    .get_mut(id)
+                    .expect("get proxy");
+
+                proxy.resp_queue().push_back(TsiResponse::RecvData);
+            }
+            None => todo!(),
+        }
+    }
+
     /// Allocate a new local port number.
     fn allocate_local_port(&mut self) -> Result<u32> {
         // TODO: Improve space efficiency of this operation
@@ -457,6 +513,7 @@ impl VhostUserVsockThread {
                     let recv_result = match rx_queue_type {
                         RxQueueType::Standard => self.thread_backend.recv_pkt(&mut pkt),
                         RxQueueType::RawPkts => self.thread_backend.recv_raw_pkt(&mut pkt),
+                        RxQueueType::ProxyPkts => self.thread_backend.recv_proxy_pkt(&mut pkt),
                     };
 
                     if recv_result.is_ok() {
@@ -511,6 +568,11 @@ impl VhostUserVsockThread {
                         break;
                     }
                 }
+                RxQueueType::ProxyPkts => {
+                    if !self.thread_backend.pending_proxy_rx() {
+                        break;
+                    }
+                }
             }
         }
         Ok(used_any)
@@ -518,6 +580,8 @@ impl VhostUserVsockThread {
 
     /// Wrapper to process rx queue based on whether event idx is enabled or not.
     pub fn process_rx(&mut self, vring: &VringRwLock, event_idx: bool) -> Result<bool> {
+        info!("SNOOPY process_rx");
+
         if event_idx {
             // To properly handle EVENT_IDX we need to keep calling
             // process_rx_queue until it stops finding new requests
@@ -655,6 +719,13 @@ impl VhostUserVsockThread {
         }
         Ok(false)
     }
+
+    /// Wrapper to process proxy packets queues (temporarily ignore event_idx)
+    pub fn process_proxy_rx(&mut self, vring: &VringRwLock, _event_idx: bool) -> Result<bool> {
+        self.process_rx_queue(vring, RxQueueType::ProxyPkts)?;
+
+        Ok(true)
+    }
 }
 
 impl Drop for VhostUserVsockThread {
@@ -662,6 +733,7 @@ impl Drop for VhostUserVsockThread {
         let _ = std::fs::remove_file(&self.host_sock_path);
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
