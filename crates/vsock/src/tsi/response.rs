@@ -10,7 +10,7 @@ use super::{proxy::ProxyID, VSOCK_HOST_CID};
 pub enum TsiResponse {
     Connect(ConnectResult),
     Listen(ListenResult),
-    RecvData,
+    RecvMsg(RecvMsgInfo),
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +25,12 @@ pub struct ListenResult {
     pub src_port: u32,
     pub dst_port: u32,
     pub result: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecvMsgInfo {
+    pub src_port: u32,
+    pub dst_port: u32,
 }
 
 pub fn init_proxy_pkt<'a, B: BitmapSlice>(

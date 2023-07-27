@@ -261,7 +261,14 @@ pub(crate) fn start_backend_servers(configs: &[VsockConfig]) -> Result<(), Backe
 }
 
 fn main() {
-    env_logger::init();
+    // env_logger::init();
+    let fd = std::fs::File::create("log").unwrap();
+
+    env_logger::Builder::new()
+        .target(env_logger::Target::Pipe(Box::new(fd)))
+        .filter_level(log::LevelFilter::Info)
+        .write_style(env_logger::WriteStyle::Always)
+        .init();
 
     let configs = match Vec::<VsockConfig>::try_from(VsockArgs::parse()) {
         Ok(c) => c,

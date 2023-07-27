@@ -1,4 +1,3 @@
-use log::info;
 use nix::{
     errno::Errno,
     sys::socket::{
@@ -8,15 +7,17 @@ use nix::{
 };
 use std::{
     collections::VecDeque,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     os::unix::io::{AsRawFd, RawFd},
 };
 
 use super::{Proxy, ProxyID, ProxyStatus};
 use crate::tsi::{
-    request::{ConnectConfig, ListenConfig},
-    response::TsiResponse,
+    request::{ConnectConfig, ListenConfig, SendMsgConfig},
+    response::{RecvMsgInfo, TsiResponse},
 };
+
+const LOCALHOST_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 
 pub struct TcpProxy {
     pub id: ProxyID,
@@ -25,7 +26,6 @@ pub struct TcpProxy {
     pub resp_queue: VecDeque<TsiResponse>,
 }
 
-#[allow(dead_code)]
 impl TcpProxy {
     pub fn new(id: ProxyID) -> Result<Self, Errno> {
         let fd = socket(
@@ -54,29 +54,29 @@ impl Proxy for TcpProxy {
     }
 
     fn connect(&mut self, connect_config: ConnectConfig) -> Result<(), Errno> {
-        info!("SNOOPY connect: {:?}", connect_config);
+        // SNOOPY HACK HERE:
+        //     Replace ip with localhost for debugging.
+        let addr = SockaddrStorage::from(SocketAddr::new(
+            IpAddr::V4(LOCALHOST_ADDR),
+            connect_config.port,
+        ));
 
-        connect(
-            self.fd,
-            &SockaddrStorage::from(SocketAddr::new(
-                IpAddr::V4(connect_config.addr),
-                connect_config.port,
-            )),
-        )?;
-
-        self.status = ProxyStatus::Connected;
-
-        Ok(())
+        match connect(self.fd, &addr) {
+            Ok(_) | Err(Errno::EINPROGRESS) => {
+                self.status = ProxyStatus::Connected;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn listen(&mut self, listen_config: ListenConfig) -> Result<(), Errno> {
-        bind(
-            self.fd,
-            &SockaddrStorage::from(SocketAddr::new(
-                IpAddr::V4(listen_config.addr),
-                listen_config.port,
-            )),
-        )?;
+        let addr = SockaddrStorage::from(SocketAddr::new(
+            IpAddr::V4(listen_config.addr),
+            listen_config.port,
+        ));
+
+        bind(self.fd, &addr)?;
 
         listen(self.fd, listen_config.backlog as usize)?;
 
@@ -87,10 +87,17 @@ impl Proxy for TcpProxy {
         let len = recv(self.fd, buffer, MsgFlags::empty())?;
 
         if len == buffer.len() {
-            self.resp_queue.push_back(TsiResponse::RecvData);
+            self.resp_queue.push_back(TsiResponse::RecvMsg(RecvMsgInfo {
+                src_port: 0,
+                dst_port: self.id.peer_port,
+            }));
         }
 
         Ok(len)
+    }
+
+    fn send(&mut self, _send_msg_config: SendMsgConfig) -> Result<usize, Errno> {
+        todo!()
     }
 }
 

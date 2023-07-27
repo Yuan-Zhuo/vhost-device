@@ -2,7 +2,7 @@ use nix::{
     errno::Errno,
     fcntl::{fcntl, FcntlArg, OFlag},
     sys::socket::{
-        connect, recv, socket, AddressFamily, MsgFlags, SockFlag, SockType, SockaddrStorage,
+        connect, recv, send, socket, AddressFamily, MsgFlags, SockFlag, SockType, SockaddrStorage,
     },
 };
 use std::{
@@ -13,8 +13,8 @@ use std::{
 
 use super::{Proxy, ProxyID, ProxyStatus};
 use crate::tsi::{
-    request::{ConnectConfig, ListenConfig},
-    response::TsiResponse,
+    request::{ConnectConfig, ListenConfig, SendMsgConfig},
+    response::{RecvMsgInfo, TsiResponse},
 };
 
 const LOCALHOST_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
@@ -57,13 +57,13 @@ impl Proxy for UdpProxy {
     }
 
     fn connect(&mut self, connect_config: ConnectConfig) -> Result<(), Errno> {
-        connect(
-            self.fd,
-            &SockaddrStorage::from(SocketAddr::new(
-                IpAddr::V4(LOCALHOST_ADDR),
-                connect_config.port,
-            )),
-        )?;
+        // SNOOPY HACK HERE:
+        //     Replace ip with localhost for debugging.
+        let addr = SockaddrStorage::from(SocketAddr::new(
+            IpAddr::V4(LOCALHOST_ADDR),
+            connect_config.port,
+        ));
+        connect(self.fd, &addr)?;
 
         self.status = ProxyStatus::Connected;
 
@@ -71,17 +71,24 @@ impl Proxy for UdpProxy {
     }
 
     fn listen(&mut self, _listen_config: ListenConfig) -> Result<(), Errno> {
-        todo!()
+        unreachable!()
     }
 
     fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, Errno> {
         let len = recv(self.fd, buffer, MsgFlags::empty())?;
 
         if len == buffer.len() {
-            self.resp_queue.push_back(TsiResponse::RecvData);
+            self.resp_queue.push_back(TsiResponse::RecvMsg(RecvMsgInfo {
+                src_port: 0,
+                dst_port: self.id.peer_port,
+            }));
         }
 
         Ok(len)
+    }
+
+    fn send(&mut self, send_msg_config: SendMsgConfig) -> Result<usize, Errno> {
+        send(self.fd, &send_msg_config.data, MsgFlags::MSG_NOSIGNAL)
     }
 }
 

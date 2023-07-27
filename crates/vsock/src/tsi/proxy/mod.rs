@@ -6,7 +6,7 @@ use std::{collections::VecDeque, os::fd::AsRawFd};
 use nix::errno::Errno;
 
 use super::{
-    request::{ConnectConfig, ListenConfig},
+    request::{ConnectConfig, ListenConfig, SendMsgConfig},
     TsiResponse,
 };
 
@@ -41,6 +41,7 @@ pub trait Proxy: Send + AsRawFd {
     // Tsi Requsets
     fn connect(&mut self, connect_config: ConnectConfig) -> Result<(), Errno>;
     fn listen(&mut self, listen_config: ListenConfig) -> Result<(), Errno>;
+    fn send(&mut self, send_msg_config: SendMsgConfig) -> Result<usize, Errno>;
 
     // Proxy Events
     fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, Errno>;

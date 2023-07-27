@@ -27,7 +27,7 @@ use vmm_sys_util::{
 use crate::{
     rxops::*,
     thread_backend::*,
-    tsi::TsiResponse,
+    tsi::{response::RecvMsgInfo, TsiResponse},
     vhu_vsock::{
         CidMap, ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT, PROXY_EVENT,
         SIBLING_VM_EVENT, VSOCK_HOST_CID,
@@ -37,6 +37,7 @@ use crate::{
 
 type ArcVhostBknd = Arc<VhostUserVsockBackend>;
 
+#[derive(Debug)]
 enum RxQueueType {
     Standard,
     RawPkts,
@@ -394,7 +395,14 @@ impl VhostUserVsockThread {
                     .get_mut(id)
                     .expect("get proxy");
 
-                proxy.resp_queue().push_back(TsiResponse::RecvData);
+                proxy
+                    .resp_queue()
+                    .push_back(TsiResponse::RecvMsg(RecvMsgInfo {
+                        src_port: 0,
+                        dst_port: id.peer_port,
+                    }));
+
+                self.thread_backend.proxy_rxq.push_back(id.clone());
             }
             None => todo!(),
         }

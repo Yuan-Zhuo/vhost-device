@@ -81,7 +81,7 @@ pub(crate) struct VsockThreadBackend {
     /// Maps the port numbers of both parties to a proxy. Used for TSI.
     pub proxy_map: HashMap<ProxyID, Box<dyn Proxy>>,
     /// Queue of ProxyID objects indicating pending rx operations.
-    proxy_rxq: VecDeque<ProxyID>,
+    pub proxy_rxq: VecDeque<ProxyID>,
 }
 
 impl VsockThreadBackend {
@@ -198,12 +198,6 @@ impl VsockThreadBackend {
             return Ok(());
         }
 
-        info!(
-            "SNOOPY: send_pkt: src_port: {} dst_port: {}",
-            pkt.src_port(),
-            pkt.dst_port()
-        );
-
         let dst_cid = pkt.dst_cid();
         if dst_cid != VSOCK_HOST_CID {
             let cid_map = self.cid_map.read().unwrap();
@@ -277,37 +271,30 @@ impl VsockThreadBackend {
 
                 match tsi_req {
                     TsiRequest::PorxyCreate(proxy_create_config) => {
-                        match proxy_create_config.type_ {
-                            SOCK_STREAM => {
-                                let tcp_proxy = TcpProxy::new(ProxyID::new(
+                        let proxy: Box<dyn Proxy> = match proxy_create_config.type_ {
+                            SOCK_STREAM => Box::new(
+                                TcpProxy::new(ProxyID::new(
                                     self.guest_cid,
                                     proxy_create_config.peer_port,
                                     PROXY_PORT,
                                 ))
-                                .map_err(|e| Error::UnixCreate(e.into()))?;
-
-                                self.proxy_fd_map
-                                    .insert(tcp_proxy.fd, tcp_proxy.id().clone());
-
-                                self.proxy_map
-                                    .insert(tcp_proxy.id().clone(), Box::new(tcp_proxy));
-                            }
-                            SOCK_DGRAM => {
-                                let udp_proxy = UdpProxy::new(ProxyID::new(
+                                .map_err(|e| Error::UnixCreate(e.into()))?,
+                            ),
+                            SOCK_DGRAM => Box::new(
+                                UdpProxy::new(ProxyID::new(
                                     self.guest_cid,
                                     proxy_create_config.peer_port,
                                     PROXY_PORT,
                                 ))
-                                .map_err(|e| Error::UnixCreate(e.into()))?;
-
-                                self.proxy_fd_map
-                                    .insert(udp_proxy.fd, udp_proxy.id().clone());
-
-                                self.proxy_map
-                                    .insert(udp_proxy.id().clone(), Box::new(udp_proxy));
-                            }
+                                .map_err(|e| Error::UnixCreate(e.into()))?,
+                            ),
                             _ => unreachable!(),
-                        }
+                        };
+
+                        self.proxy_fd_map
+                            .insert(proxy.as_raw_fd(), proxy.id().clone());
+
+                        self.proxy_map.insert(proxy.id().clone(), proxy);
                     }
                     TsiRequest::Connect(connect_config) => {
                         let mut connect_result = ConnectResult {
@@ -372,7 +359,27 @@ impl VsockThreadBackend {
                         self.proxy_rxq.push_back(id);
                     }
                     TsiRequest::Accept(_) => todo!(),
-                    TsiRequest::ProxyRelease(_) => {}
+                    TsiRequest::SendMsg(send_msg_config) => {
+                        let id: ProxyID =
+                            ProxyID::new(self.guest_cid, send_msg_config.peer_port, PROXY_PORT);
+
+                        let proxy = self.proxy_map.get_mut(&id).ok_or(Error::ProxyNotFound)?;
+
+                        proxy.send(send_msg_config).map_err(|_| Error::UnixWrite)?;
+                    }
+                    TsiRequest::ProxyRelease(proxy_release_config) => {
+                        let id: ProxyID = ProxyID::new(
+                            self.guest_cid,
+                            proxy_release_config.peer_port,
+                            proxy_release_config.local_port,
+                        );
+
+                        let proxy = self.proxy_map.remove(&id).ok_or(Error::ProxyNotFound)?;
+
+                        let fd = proxy.as_raw_fd();
+                        self.proxy_fd_map.remove(&fd).ok_or(Error::ProxyNotFound)?;
+                        VhostUserVsockThread::epoll_unregister(self.proxy_event_fd, fd)?;
+                    }
                 }
             }
             _ => {
@@ -435,14 +442,16 @@ impl VsockThreadBackend {
                     .set_dst_port(listen_result.dst_port)
                     .set_op(TsiRespOp::Rw.into());
             }
-            TsiResponse::RecvData => {
-                let mut buffer = Vec::with_capacity(data_slice.len());
-                let read_cnt = proxy
+            TsiResponse::RecvMsg(recv_msg_info) => {
+                let mut buffer = vec![0u8; data_slice.len()];
+                pkt_len = proxy
                     .recv(&mut buffer)
                     .map_err(|e| Error::UnixRead(e.into()))?;
-                data_slice.copy_from(&buffer[..read_cnt]);
+                data_slice.copy_from(&buffer[..pkt_len]);
 
-                pkt.set_op(TsiRespOp::Rw.into());
+                pkt.set_src_port(recv_msg_info.src_port)
+                    .set_dst_port(recv_msg_info.dst_port)
+                    .set_op(TsiRespOp::Rw.into());
             }
         }
 

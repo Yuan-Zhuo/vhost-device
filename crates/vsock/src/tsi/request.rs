@@ -2,7 +2,6 @@ use crate::tsi::utils::{read_be_u16, read_le_i32, read_le_u16, read_le_u32, read
 use crate::tsi::TsiReqOp;
 use crate::vhu_vsock::{Error, Result};
 
-use log::info;
 use std::convert::TryFrom;
 use std::net::Ipv4Addr;
 use strum::Display;
@@ -18,6 +17,7 @@ pub enum TsiRequest {
     SendtoData,
     Listen(ListenConfig),
     Accept(AcceptConfig),
+    SendMsg(SendMsgConfig),
     ProxyRelease(ProxyReleaseConfig),
 }
 
@@ -69,6 +69,12 @@ pub struct ProxyReleaseConfig {
     pub local_port: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct SendMsgConfig {
+    pub peer_port: u32,
+    pub data: Box<Vec<u8>>,
+}
+
 /// Convert VsockPacket to different types of TsiRequest
 impl<'a, B: BitmapSlice> TryFrom<&VsockPacket<'a, B>> for TsiRequest {
     type Error = Error;
@@ -79,7 +85,6 @@ impl<'a, B: BitmapSlice> TryFrom<&VsockPacket<'a, B>> for TsiRequest {
         let len = data_slice.len();
         let mut buffer = vec![0u8; len];
         data_slice.copy_to(&mut buffer);
-        info!("SNOOPY data_slice: {:?}", buffer);
 
         match pkt.dst_port().into() {
             TsiReqOp::ProxyCreate => Ok(Self::PorxyCreate(ProxyCreateConfig {
@@ -132,9 +137,10 @@ impl<'a, B: BitmapSlice> TryFrom<&VsockPacket<'a, B>> for TsiRequest {
                 peer_port: read_le_u32(data_slice, 0)?,
                 local_port: read_le_u32(data_slice, 4)?,
             })),
-            TsiReqOp::Unknown => {
-                unreachable!()
-            }
+            TsiReqOp::Unknown => Ok(Self::SendMsg(SendMsgConfig {
+                peer_port: pkt.src_port(),
+                data: Box::new(buffer),
+            })),
         }
     }
 }
