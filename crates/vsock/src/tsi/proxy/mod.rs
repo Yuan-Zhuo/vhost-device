@@ -34,15 +34,22 @@ impl ProxyID {
     }
 }
 
+pub enum ProxyType {
+    Stream,
+    Dgram,
+}
+
 pub trait Proxy: Send + AsRawFd {
+    fn type_(&self) -> ProxyType;
     fn id(&self) -> &ProxyID;
+    fn fwd_cnt(&self) -> u32;
     fn resp_queue(&mut self) -> &mut VecDeque<TsiResponse>;
 
     // Tsi Requsets
     fn connect(&mut self, connect_config: ConnectConfig) -> Result<(), Errno>;
     fn listen(&mut self, listen_config: ListenConfig) -> Result<(), Errno>;
-    fn send(&mut self, send_msg_config: SendMsgConfig) -> Result<usize, Errno>;
+    fn send(&mut self, send_msg_config: SendMsgConfig) -> Result<bool, Errno>;
 
     // Proxy Events
-    fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, Errno>;
+    fn recv(&mut self, buffer: &mut [u8]) -> Result<u32, Errno>;
 }

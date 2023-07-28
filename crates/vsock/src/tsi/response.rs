@@ -10,7 +10,9 @@ use super::{proxy::ProxyID, VSOCK_HOST_CID};
 pub enum TsiResponse {
     Connect(ConnectResult),
     Listen(ListenResult),
-    RecvMsg(RecvMsgInfo),
+    RecvStreamMsg(RecvStreamMsgInfo),
+    RecvDgramMsg(RecvDgramMsgInfo),
+    CreditUpdate(CreditUpdateResult),
 }
 
 #[derive(Debug, Clone)]
@@ -28,11 +30,27 @@ pub struct ListenResult {
 }
 
 #[derive(Debug, Clone)]
-pub struct RecvMsgInfo {
+pub struct RecvStreamMsgInfo {
+    pub src_port: u32,
+    pub dst_port: u32,
+    pub fwd_cnt: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecvDgramMsgInfo {
     pub src_port: u32,
     pub dst_port: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct CreditUpdateResult {
+    pub src_port: u32,
+    pub dst_port: u32,
+    pub fwd_cnt: u32,
+}
+
+// SNOOPY-TODO:
+//      pkt.set_type: VSOCK_TYPE_DGRAM or VSOCK_TYPE_STREAM
 pub fn init_proxy_pkt<'a, B: BitmapSlice>(
     id: &ProxyID,
     pkt: &mut VsockPacket<'a, B>,

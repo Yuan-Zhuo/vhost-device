@@ -15,6 +15,8 @@ pub const SOCK_DGRAM: u16 = 2;
 
 pub const PROXY_PORT: u32 = 620;
 
+pub const CONN_TX_BUF_SIZE: u32 = 8 << 20;
+
 /// Reserved ports indicating the operation type
 enum TsiReqOp {
     ProxyCreate,

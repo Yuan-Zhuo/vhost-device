@@ -27,7 +27,11 @@ use vmm_sys_util::{
 use crate::{
     rxops::*,
     thread_backend::*,
-    tsi::{response::RecvMsgInfo, TsiResponse},
+    tsi::{
+        proxy::ProxyType,
+        response::{RecvDgramMsgInfo, RecvStreamMsgInfo},
+        TsiResponse,
+    },
     vhu_vsock::{
         CidMap, ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT, PROXY_EVENT,
         SIBLING_VM_EVENT, VSOCK_HOST_CID,
@@ -395,12 +399,26 @@ impl VhostUserVsockThread {
                     .get_mut(id)
                     .expect("get proxy");
 
-                proxy
-                    .resp_queue()
-                    .push_back(TsiResponse::RecvMsg(RecvMsgInfo {
-                        src_port: 0,
-                        dst_port: id.peer_port,
-                    }));
+                match proxy.type_() {
+                    ProxyType::Stream => {
+                        let fwd_cnt = proxy.fwd_cnt();
+                        proxy.resp_queue().push_back(TsiResponse::RecvStreamMsg(
+                            RecvStreamMsgInfo {
+                                src_port: id.local_port,
+                                dst_port: id.peer_port,
+                                fwd_cnt,
+                            },
+                        ));
+                    }
+                    ProxyType::Dgram => {
+                        proxy
+                            .resp_queue()
+                            .push_back(TsiResponse::RecvDgramMsg(RecvDgramMsgInfo {
+                                src_port: 0,
+                                dst_port: id.peer_port,
+                            }));
+                    }
+                }
 
                 self.thread_backend.proxy_rxq.push_back(id.clone());
             }

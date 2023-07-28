@@ -11,10 +11,10 @@ use std::{
     os::unix::io::{AsRawFd, RawFd},
 };
 
-use super::{Proxy, ProxyID, ProxyStatus};
+use super::{Proxy, ProxyID, ProxyStatus, ProxyType};
 use crate::tsi::{
     request::{ConnectConfig, ListenConfig, SendMsgConfig},
-    response::{RecvMsgInfo, TsiResponse},
+    response::{RecvDgramMsgInfo, TsiResponse},
 };
 
 const LOCALHOST_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
@@ -48,8 +48,16 @@ impl UdpProxy {
 }
 
 impl Proxy for UdpProxy {
+    fn type_(&self) -> ProxyType {
+        ProxyType::Dgram
+    }
+
     fn id(&self) -> &ProxyID {
         &self.id
+    }
+
+    fn fwd_cnt(&self) -> u32 {
+        unreachable!()
     }
 
     fn resp_queue(&mut self) -> &mut VecDeque<TsiResponse> {
@@ -74,21 +82,24 @@ impl Proxy for UdpProxy {
         unreachable!()
     }
 
-    fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, Errno> {
+    fn recv(&mut self, buffer: &mut [u8]) -> Result<u32, Errno> {
         let len = recv(self.fd, buffer, MsgFlags::empty())?;
 
         if len == buffer.len() {
-            self.resp_queue.push_back(TsiResponse::RecvMsg(RecvMsgInfo {
-                src_port: 0,
-                dst_port: self.id.peer_port,
-            }));
+            self.resp_queue
+                .push_back(TsiResponse::RecvDgramMsg(RecvDgramMsgInfo {
+                    src_port: 0,
+                    dst_port: self.id.peer_port,
+                }));
         }
 
-        Ok(len)
+        Ok(len as u32)
     }
 
-    fn send(&mut self, send_msg_config: SendMsgConfig) -> Result<usize, Errno> {
-        send(self.fd, &send_msg_config.data, MsgFlags::MSG_NOSIGNAL)
+    fn send(&mut self, send_msg_config: SendMsgConfig) -> Result<bool, Errno> {
+        send(self.fd, &send_msg_config.data, MsgFlags::MSG_NOSIGNAL)?;
+
+        Ok(false)
     }
 }
 

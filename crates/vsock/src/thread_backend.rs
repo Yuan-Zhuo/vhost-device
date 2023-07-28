@@ -17,9 +17,10 @@ use vm_memory::bitmap::BitmapSlice;
 use crate::{
     rxops::*,
     tsi::{
-        proxy::{tcp::TcpProxy, udp::UdpProxy, Proxy, ProxyID},
+        proxy::{tcp::TcpProxy, udp::UdpProxy, Proxy, ProxyID, ProxyType},
         response::{init_proxy_pkt, ConnectResult, ListenResult},
-        write_le_i32, TsiRequest, TsiRespOp, TsiResponse, PROXY_PORT, SOCK_DGRAM, SOCK_STREAM,
+        write_le_i32, TsiRequest, TsiRespOp, TsiResponse, CONN_TX_BUF_SIZE, PROXY_PORT, SOCK_DGRAM,
+        SOCK_STREAM,
     },
     vhu_vsock::{
         CidMap, ConnMapKey, Error, Result, VSOCK_HOST_CID, VSOCK_OP_REQUEST, VSOCK_OP_RST,
@@ -269,6 +270,17 @@ impl VsockThreadBackend {
 
                 info!("SNOOPY tsi_request: {:?}", tsi_req);
 
+                // UDP:
+                //    guest as client & host as server:
+                //        guest: PorxyCreate -> Connect -> SendMsg(5 * '88') || -> SendMsg/RecvMsg freely
+                //        host: Connection received -> RecvMsg(5 * '88') || -> SendMsg/RecvMsg freely
+                // TCP:
+                //    guest as client & host as server:
+                //        guest: PorxyCreate -> Connect || -> SendMsg/RecvMsg freely
+                //        host: Connection received || -> SendMsg/RecvMsg freely (CreditUpdate occasionally)
+                //    guest as server & host as client:
+                //        guest: ProxyCreate -> Listen
+                //        host:
                 match tsi_req {
                     TsiRequest::PorxyCreate(proxy_create_config) => {
                         let proxy: Box<dyn Proxy> = match proxy_create_config.type_ {
@@ -280,8 +292,10 @@ impl VsockThreadBackend {
                                 ))
                                 .map_err(|e| Error::UnixCreate(e.into()))?,
                             ),
+                            // SNOOPY HACK HERE:
+                            //      Temporarily Treat as SOCK_STREAM
                             SOCK_DGRAM => Box::new(
-                                UdpProxy::new(ProxyID::new(
+                                TcpProxy::new(ProxyID::new(
                                     self.guest_cid,
                                     proxy_create_config.peer_port,
                                     PROXY_PORT,
@@ -327,7 +341,7 @@ impl VsockThreadBackend {
                             }
                         };
 
-                        // connect request requires a reply
+                        // both TCP's and UDP's connect request requires a reply
                         proxy
                             .resp_queue()
                             .push_back(TsiResponse::Connect(connect_result));
@@ -352,7 +366,7 @@ impl VsockThreadBackend {
                             listen_result.result = -(errno as i32)
                         };
 
-                        // listen request requires a reply
+                        // TCP's listen request requires a reply
                         proxy
                             .resp_queue()
                             .push_back(TsiResponse::Listen(listen_result));
@@ -366,6 +380,8 @@ impl VsockThreadBackend {
                         let proxy = self.proxy_map.get_mut(&id).ok_or(Error::ProxyNotFound)?;
 
                         proxy.send(send_msg_config).map_err(|_| Error::UnixWrite)?;
+
+                        //  self.proxy_rxq.push_back(id);
                     }
                     TsiRequest::ProxyRelease(proxy_release_config) => {
                         let id: ProxyID = ProxyID::new(
@@ -442,20 +458,40 @@ impl VsockThreadBackend {
                     .set_dst_port(listen_result.dst_port)
                     .set_op(TsiRespOp::Rw.into());
             }
-            TsiResponse::RecvMsg(recv_msg_info) => {
+            TsiResponse::RecvStreamMsg(recv_stream_msg_info) => {
                 let mut buffer = vec![0u8; data_slice.len()];
                 pkt_len = proxy
                     .recv(&mut buffer)
                     .map_err(|e| Error::UnixRead(e.into()))?;
-                data_slice.copy_from(&buffer[..pkt_len]);
+                data_slice.copy_from(&buffer[..pkt_len as usize]);
 
-                pkt.set_src_port(recv_msg_info.src_port)
-                    .set_dst_port(recv_msg_info.dst_port)
+                pkt.set_fwd_cnt(recv_stream_msg_info.fwd_cnt)
+                    .set_buf_alloc(CONN_TX_BUF_SIZE)
+                    .set_src_port(recv_stream_msg_info.src_port)
+                    .set_dst_port(recv_stream_msg_info.dst_port)
                     .set_op(TsiRespOp::Rw.into());
+            }
+            TsiResponse::RecvDgramMsg(recv_dgram_msg_info) => {
+                let mut buffer = vec![0u8; data_slice.len()];
+                pkt_len = proxy
+                    .recv(&mut buffer)
+                    .map_err(|e| Error::UnixRead(e.into()))?;
+                data_slice.copy_from(&buffer[..pkt_len as usize]);
+
+                pkt.set_src_port(recv_dgram_msg_info.src_port)
+                    .set_dst_port(recv_dgram_msg_info.dst_port)
+                    .set_op(TsiRespOp::Rw.into());
+            }
+            TsiResponse::CreditUpdate(credit_update_result) => {
+                pkt.set_fwd_cnt(credit_update_result.fwd_cnt)
+                    .set_buf_alloc(CONN_TX_BUF_SIZE)
+                    .set_src_port(credit_update_result.src_port)
+                    .set_dst_port(credit_update_result.dst_port)
+                    .set_op(TsiRespOp::CreditUpdate.into());
             }
         }
 
-        pkt.set_len(pkt_len as u32);
+        pkt.set_len(pkt_len);
 
         Ok(())
     }

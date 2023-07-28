@@ -30,14 +30,14 @@ macro_rules! define_write_le {
             slice: &VolatileSlice<B>,
             offset: usize,
             data: $t,
-        ) -> Result<usize> {
+        ) -> Result<u32> {
             let buffer = <$t>::to_le_bytes(data);
             slice
                 .offset(offset)
                 .map_err(|_| Error::InvalidPktBuf)?
                 .copy_from(&buffer);
 
-            Ok(size_of::<$t>())
+            Ok(size_of::<$t>() as u32)
         }
     };
 }

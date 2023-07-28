@@ -1,20 +1,22 @@
 use nix::{
     errno::Errno,
     sys::socket::{
-        bind, connect, listen, recv, socket, AddressFamily, MsgFlags, SockFlag, SockType,
+        bind, connect, listen, recv, send, socket, AddressFamily, MsgFlags, SockFlag, SockType,
         SockaddrStorage,
     },
 };
 use std::{
     collections::VecDeque,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::Wrapping,
     os::unix::io::{AsRawFd, RawFd},
 };
 
-use super::{Proxy, ProxyID, ProxyStatus};
+use super::{Proxy, ProxyID, ProxyStatus, ProxyType};
 use crate::tsi::{
     request::{ConnectConfig, ListenConfig, SendMsgConfig},
-    response::{RecvMsgInfo, TsiResponse},
+    response::{CreditUpdateResult, RecvStreamMsgInfo, TsiResponse},
+    CONN_TX_BUF_SIZE,
 };
 
 const LOCALHOST_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
@@ -24,6 +26,9 @@ pub struct TcpProxy {
     pub fd: RawFd,
     pub status: ProxyStatus,
     pub resp_queue: VecDeque<TsiResponse>,
+    pub tx_cnt: Wrapping<u32>,
+    pub last_tx_cnt_sent: Wrapping<u32>,
+    pub rx_cnt: Wrapping<u32>,
 }
 
 impl TcpProxy {
@@ -40,13 +45,24 @@ impl TcpProxy {
             fd,
             status: ProxyStatus::Idle,
             resp_queue: VecDeque::new(),
+            tx_cnt: Wrapping(0),
+            last_tx_cnt_sent: Wrapping(0),
+            rx_cnt: Wrapping(0),
         })
     }
 }
 
 impl Proxy for TcpProxy {
+    fn type_(&self) -> ProxyType {
+        ProxyType::Stream
+    }
+
     fn id(&self) -> &ProxyID {
         &self.id
+    }
+
+    fn fwd_cnt(&self) -> u32 {
+        self.tx_cnt.0
     }
 
     fn resp_queue(&mut self) -> &mut VecDeque<TsiResponse> {
@@ -83,21 +99,40 @@ impl Proxy for TcpProxy {
         Ok(())
     }
 
-    fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, Errno> {
+    fn recv(&mut self, buffer: &mut [u8]) -> Result<u32, Errno> {
         let len = recv(self.fd, buffer, MsgFlags::empty())?;
+        self.rx_cnt += len as u32;
 
         if len == buffer.len() {
-            self.resp_queue.push_back(TsiResponse::RecvMsg(RecvMsgInfo {
-                src_port: 0,
-                dst_port: self.id.peer_port,
-            }));
+            self.resp_queue
+                .push_back(TsiResponse::RecvStreamMsg(RecvStreamMsgInfo {
+                    src_port: self.id.local_port,
+                    dst_port: self.id.peer_port,
+                    fwd_cnt: self.tx_cnt.0,
+                }));
         }
 
-        Ok(len)
+        Ok(len as u32)
     }
 
-    fn send(&mut self, _send_msg_config: SendMsgConfig) -> Result<usize, Errno> {
-        todo!()
+    fn send(&mut self, send_msg_config: SendMsgConfig) -> Result<bool, Errno> {
+        let len = send(self.fd, &send_msg_config.data, MsgFlags::MSG_NOSIGNAL)? as u32;
+        self.tx_cnt += len;
+
+        let credit_update =
+            len > 0 && (self.tx_cnt - self.last_tx_cnt_sent).0 >= (CONN_TX_BUF_SIZE / 2);
+
+        if credit_update {
+            self.last_tx_cnt_sent = self.tx_cnt;
+            self.resp_queue
+                .push_back(TsiResponse::CreditUpdate(CreditUpdateResult {
+                    src_port: self.id.local_port,
+                    dst_port: self.id.peer_port,
+                    fwd_cnt: self.tx_cnt.0,
+                }));
+        }
+
+        Ok(credit_update)
     }
 }
 
