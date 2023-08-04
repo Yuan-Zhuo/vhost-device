@@ -1,38 +1,38 @@
 use nix::{
     errno::Errno,
     sys::socket::{
-        bind, connect, listen, recv, send, socket, AddressFamily, MsgFlags, SockFlag, SockType,
-        SockaddrStorage,
+        accept, bind, connect, getpeername, listen, recv, send, socket, AddressFamily, MsgFlags,
+        SockFlag, SockType, SockaddrIn, SockaddrStorage,
     },
 };
 use std::{
     collections::VecDeque,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     num::Wrapping,
     os::unix::io::{AsRawFd, RawFd},
 };
 
-use super::{Proxy, ProxyID, ProxyStatus, ProxyType};
+use super::{Proxy, ProxyID, ProxyStatus, ProxyType, Result};
 use crate::tsi::{
-    request::{ConnectConfig, ListenConfig, SendMsgConfig},
+    request::{AcceptConfig, ConnectConfig, ListenConfig, OpResponseConfig, SendMsgConfig},
     response::{CreditUpdateResult, RecvStreamMsgInfo, TsiResponse},
     CONN_TX_BUF_SIZE,
 };
 
-const LOCALHOST_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
-
 pub struct TcpProxy {
-    pub id: ProxyID,
-    pub fd: RawFd,
-    pub status: ProxyStatus,
-    pub resp_queue: VecDeque<TsiResponse>,
-    pub tx_cnt: Wrapping<u32>,
-    pub last_tx_cnt_sent: Wrapping<u32>,
-    pub rx_cnt: Wrapping<u32>,
+    id: ProxyID,
+    fd: RawFd,
+    status: ProxyStatus,
+    resp_queue: VecDeque<TsiResponse>,
+    control_port: u32,
+    tx_cnt: Wrapping<u32>,
+    last_tx_cnt_sent: Wrapping<u32>,
+    rx_cnt: Wrapping<u32>,
+    pending_accepts: u32,
 }
 
 impl TcpProxy {
-    pub fn new(id: ProxyID) -> Result<Self, Errno> {
+    pub fn new(id: ProxyID, control_port: u32) -> Result<Self> {
         let fd = socket(
             AddressFamily::Inet,
             SockType::Stream,
@@ -44,10 +44,12 @@ impl TcpProxy {
             id,
             fd,
             status: ProxyStatus::Idle,
+            control_port,
             resp_queue: VecDeque::new(),
             tx_cnt: Wrapping(0),
             last_tx_cnt_sent: Wrapping(0),
             rx_cnt: Wrapping(0),
+            pending_accepts: 0,
         })
     }
 }
@@ -57,8 +59,16 @@ impl Proxy for TcpProxy {
         ProxyType::Stream
     }
 
+    fn status(&self) -> ProxyStatus {
+        self.status
+    }
+
     fn id(&self) -> &ProxyID {
         &self.id
+    }
+
+    fn control_port(&self) -> u32 {
+        self.control_port
     }
 
     fn fwd_cnt(&self) -> u32 {
@@ -69,11 +79,9 @@ impl Proxy for TcpProxy {
         &mut self.resp_queue
     }
 
-    fn connect(&mut self, connect_config: ConnectConfig) -> Result<(), Errno> {
-        // SNOOPY HACK HERE:
-        //     Replace ip with localhost for debugging.
+    fn connect(&mut self, connect_config: ConnectConfig) -> Result<()> {
         let addr = SockaddrStorage::from(SocketAddr::new(
-            IpAddr::V4(LOCALHOST_ADDR),
+            IpAddr::V4(connect_config.addr),
             connect_config.port,
         ));
 
@@ -86,7 +94,7 @@ impl Proxy for TcpProxy {
         }
     }
 
-    fn listen(&mut self, listen_config: ListenConfig) -> Result<(), Errno> {
+    fn listen(&mut self, listen_config: ListenConfig) -> Result<()> {
         let addr = SockaddrStorage::from(SocketAddr::new(
             IpAddr::V4(listen_config.addr),
             listen_config.port,
@@ -96,12 +104,65 @@ impl Proxy for TcpProxy {
 
         listen(self.fd, listen_config.backlog as usize)?;
 
+        self.status = ProxyStatus::Listen;
+
         Ok(())
     }
 
-    fn recv(&mut self, buffer: &mut [u8]) -> Result<u32, Errno> {
+    fn check_accept(&mut self, accept_config: AcceptConfig) -> Option<i32> {
+        let result = if self.pending_accepts > 0 {
+            self.pending_accepts -= 1;
+            0
+        } else if (accept_config.flags & SockFlag::SOCK_NONBLOCK.bits() as u32) != 0 {
+            -(Errno::EWOULDBLOCK as i32)
+        } else {
+            return None;
+        };
+
+        Some(result)
+    }
+
+    fn ack_accept(&mut self, op_response_config: OpResponseConfig) -> Result<()> {
+        self.tx_cnt = Wrapping(op_response_config.fwd_cnt);
+        self.status = ProxyStatus::Connected;
+
+        Ok(())
+    }
+
+    fn accept(&mut self, accept_id: ProxyID) -> Result<Box<dyn Proxy>> {
+        let accept_fd = accept(self.fd)?;
+
+        Ok(Box::new(TcpProxy {
+            id: accept_id,
+            control_port: self.control_port,
+            fd: accept_fd,
+            status: ProxyStatus::ReverseInit,
+            resp_queue: VecDeque::new(),
+            tx_cnt: Wrapping(0),
+            last_tx_cnt_sent: Wrapping(0),
+            rx_cnt: Wrapping(0),
+            pending_accepts: 0,
+        }))
+    }
+
+    fn getpeername(&self) -> Result<SockaddrIn> {
+        let peername = getpeername::<SockaddrStorage>(self.fd)?;
+        let sock_addr = peername
+            .as_sockaddr_in()
+            .ok_or(Errno::EADDRNOTAVAIL)?
+            .clone();
+
+        Ok(sock_addr)
+    }
+
+    fn recv(&mut self, buffer: &mut [u8]) -> Result<u32> {
         let len = recv(self.fd, buffer, MsgFlags::empty())?;
         self.rx_cnt += len as u32;
+
+        if len == 0 {
+            self.status = ProxyStatus::Closed;
+            return Err(Errno::ENODATA);
+        }
 
         if len == buffer.len() {
             self.resp_queue
@@ -115,7 +176,7 @@ impl Proxy for TcpProxy {
         Ok(len as u32)
     }
 
-    fn send(&mut self, send_msg_config: SendMsgConfig) -> Result<bool, Errno> {
+    fn send(&mut self, send_msg_config: SendMsgConfig) -> Result<bool> {
         let len = send(self.fd, &send_msg_config.data, MsgFlags::MSG_NOSIGNAL)? as u32;
         self.tx_cnt += len;
 

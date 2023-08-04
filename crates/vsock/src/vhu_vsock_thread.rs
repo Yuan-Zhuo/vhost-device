@@ -14,7 +14,7 @@ use std::{
 };
 
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
-use log::{info, warn};
+use log::warn;
 use vhost_user_backend::{VringEpollHandler, VringRwLock, VringT};
 use virtio_queue::QueueOwnedT;
 use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
@@ -28,8 +28,8 @@ use crate::{
     rxops::*,
     thread_backend::*,
     tsi::{
-        proxy::ProxyType,
-        response::{RecvDgramMsgInfo, RecvStreamMsgInfo},
+        proxy::{ProxyStatus, ProxyType},
+        response::{OpResult, RecvDgramMsgInfo, RecvStreamMsgInfo},
         TsiResponse,
     },
     vhu_vsock::{
@@ -391,39 +391,64 @@ impl VhostUserVsockThread {
     }
 
     fn handle_proxy_event(&mut self, fd: RawFd, _evset: epoll::Events) {
-        match self.thread_backend.proxy_fd_map.get(&fd) {
-            Some(id) => {
+        let id = {
+            match self.thread_backend.proxy_fd_map.get(&fd) {
+                Some(id) => id.clone(),
+                None => return,
+            }
+        };
+
+        match self
+            .thread_backend
+            .proxy_map
+            .get_mut(&id)
+            .expect("get proxy")
+            .status()
+        {
+            ProxyStatus::Connected => {
                 let proxy = self
                     .thread_backend
                     .proxy_map
-                    .get_mut(id)
+                    .get_mut(&id)
                     .expect("get proxy");
 
-                match proxy.type_() {
+                let recv_msg_resp = match proxy.type_() {
                     ProxyType::Stream => {
                         let fwd_cnt = proxy.fwd_cnt();
-                        proxy.resp_queue().push_back(TsiResponse::RecvStreamMsg(
-                            RecvStreamMsgInfo {
-                                src_port: id.local_port,
-                                dst_port: id.peer_port,
-                                fwd_cnt,
-                            },
-                        ));
+                        TsiResponse::RecvStreamMsg(RecvStreamMsgInfo {
+                            src_port: id.local_port,
+                            dst_port: id.peer_port,
+                            fwd_cnt,
+                        })
                     }
-                    ProxyType::Dgram => {
-                        proxy
-                            .resp_queue()
-                            .push_back(TsiResponse::RecvDgramMsg(RecvDgramMsgInfo {
-                                src_port: 0,
-                                dst_port: id.peer_port,
-                            }));
-                    }
-                }
+                    ProxyType::Dgram => TsiResponse::RecvDgramMsg(RecvDgramMsgInfo {
+                        src_port: 0,
+                        dst_port: id.peer_port,
+                    }),
+                };
 
+                proxy.resp_queue().push_back(recv_msg_resp);
                 self.thread_backend.proxy_rxq.push_back(id.clone());
             }
-            None => todo!(),
-        }
+            ProxyStatus::Listen => {
+                let accept_id = self.thread_backend.accept_proxy(&id).expect("accept proxy");
+
+                let accept_proxy = self
+                    .thread_backend
+                    .proxy_map
+                    .get_mut(&accept_id)
+                    .expect("get proxy");
+
+                let op_resp = TsiResponse::Op(OpResult {
+                    src_port: accept_id.local_port,
+                    dst_port: accept_id.peer_port,
+                });
+
+                accept_proxy.resp_queue().push_back(op_resp);
+                self.thread_backend.proxy_rxq.push_back(accept_id);
+            }
+            ProxyStatus::Idle | ProxyStatus::Closed | ProxyStatus::ReverseInit => unreachable!(),
+        };
     }
 
     /// Allocate a new local port number.
@@ -606,8 +631,6 @@ impl VhostUserVsockThread {
 
     /// Wrapper to process rx queue based on whether event idx is enabled or not.
     pub fn process_rx(&mut self, vring: &VringRwLock, event_idx: bool) -> Result<bool> {
-        info!("SNOOPY process_rx");
-
         if event_idx {
             // To properly handle EVENT_IDX we need to keep calling
             // process_rx_queue until it stops finding new requests

@@ -10,9 +10,12 @@ use super::{proxy::ProxyID, VSOCK_HOST_CID};
 pub enum TsiResponse {
     Connect(ConnectResult),
     Listen(ListenResult),
+    Accept(AcceptResult),
     RecvStreamMsg(RecvStreamMsgInfo),
     RecvDgramMsg(RecvDgramMsgInfo),
     CreditUpdate(CreditUpdateResult),
+    Op(OpResult),
+    GetPeername(GetPeernameResult),
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +50,28 @@ pub struct CreditUpdateResult {
     pub src_port: u32,
     pub dst_port: u32,
     pub fwd_cnt: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcceptResult {
+    pub src_port: u32,
+    pub dst_port: u32,
+    pub result: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpResult {
+    pub src_port: u32,
+    pub dst_port: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct GetPeernameResult {
+    pub src_port: u32,
+    pub dst_port: u32,
+    pub addr: u32,
+    pub port: u16,
+    pub result: i32,
 }
 
 // SNOOPY-TODO:

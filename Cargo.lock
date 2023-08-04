@@ -1389,6 +1389,7 @@ dependencies = [
  "futures",
  "log",
  "nix",
+ "rand",
  "serde",
  "serde_yaml",
  "strum 0.24.1",

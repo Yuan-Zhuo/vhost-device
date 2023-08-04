@@ -302,17 +302,14 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
         let vring_rx = &vrings[0];
         let vring_tx = &vrings[1];
 
+        info!("SNOOPY handle_event: device_event: {} evset {:?}", device_event, evset);
+
         if evset != EventSet::IN {
             return Err(Error::HandleEventNotEpollIn.into());
         }
 
         let mut thread = self.threads[thread_id].lock().unwrap();
         let evt_idx = thread.event_idx;
-
-        info!(
-            "SNOOPY handle_event: device_event: {} evt_idx: {:?}",
-            device_event, evt_idx
-        );
 
         match device_event {
             RX_QUEUE_EVENT => {}

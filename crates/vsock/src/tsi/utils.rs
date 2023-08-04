@@ -24,14 +24,14 @@ define_read!(read_le_u32, from_le_bytes, u32, 4);
 define_read!(read_le_i32, from_le_bytes, i32, 4);
 define_read!(read_be_u16, from_be_bytes, u16, 2);
 
-macro_rules! define_write_le {
-    ($name:ident, $t:ty) => {
+macro_rules! define_write {
+    ($name:ident, $to_bytes:ident, $t:ty) => {
         pub fn $name<B: BitmapSlice>(
             slice: &VolatileSlice<B>,
             offset: usize,
             data: $t,
         ) -> Result<u32> {
-            let buffer = <$t>::to_le_bytes(data);
+            let buffer = <$t>::$to_bytes(data);
             slice
                 .offset(offset)
                 .map_err(|_| Error::InvalidPktBuf)?
@@ -42,4 +42,6 @@ macro_rules! define_write_le {
     };
 }
 
-define_write_le!(write_le_i32, i32);
+define_write!(write_le_u16, to_le_bytes, u16);
+define_write!(write_le_i32, to_le_bytes, i32);
+define_write!(write_be_u32, to_be_bytes, u32);

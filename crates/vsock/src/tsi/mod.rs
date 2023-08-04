@@ -6,7 +6,7 @@ mod utils;
 
 pub use request::TsiRequest;
 pub use response::TsiResponse;
-pub use utils::write_le_i32;
+pub use utils::{write_be_u32, write_le_i32, write_le_u16};
 
 pub const VSOCK_HOST_CID: u64 = 2;
 
@@ -18,8 +18,9 @@ pub const PROXY_PORT: u32 = 620;
 pub const CONN_TX_BUF_SIZE: u32 = 8 << 20;
 
 /// Reserved ports indicating the operation type
-enum TsiReqOp {
-    ProxyCreate,
+#[derive(PartialEq, Eq)]
+pub enum TsiReqCtlOp {
+    ProxyCreate = 1024,
     Connect,
     Getname,
     SendtoAddr,
@@ -30,7 +31,7 @@ enum TsiReqOp {
     Unknown,
 }
 
-impl From<u32> for TsiReqOp {
+impl From<u32> for TsiReqCtlOp {
     fn from(port: u32) -> Self {
         match port {
             1024 => Self::ProxyCreate,
@@ -46,9 +47,36 @@ impl From<u32> for TsiReqOp {
     }
 }
 
+/// Op mappings
+pub enum TsiStreamOp {
+    Request = 1,
+    Response,
+    Rst,
+    ShutDown,
+    Rw,
+    CreditUpdate,
+    CreditRequest,
+    Unknown,
+}
+
+impl From<u16> for TsiStreamOp {
+    fn from(op: u16) -> Self {
+        match op {
+            1 => Self::Request,
+            2 => Self::Response,
+            3 => Self::Rst,
+            4 => Self::ShutDown,
+            5 => Self::Rw,
+            6 => Self::CreditUpdate,
+            7 => Self::CreditRequest,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 #[allow(dead_code)]
-pub enum TsiRespOp {
-    Request,
+pub enum TsiRespCtlOp {
+    Request = 1,
     Response,
     Rst,
     ShutDown,
@@ -57,16 +85,16 @@ pub enum TsiRespOp {
     CreditRequest,
 }
 
-impl Into<u16> for TsiRespOp {
+impl Into<u16> for TsiRespCtlOp {
     fn into(self) -> u16 {
         match self {
-            TsiRespOp::Request => 1,
-            TsiRespOp::Response => 2,
-            TsiRespOp::Rst => 3,
-            TsiRespOp::ShutDown => 4,
-            TsiRespOp::Rw => 5,
-            TsiRespOp::CreditUpdate => 6,
-            TsiRespOp::CreditRequest => 7,
+            TsiRespCtlOp::Request => 1,
+            TsiRespCtlOp::Response => 2,
+            TsiRespCtlOp::Rst => 3,
+            TsiRespCtlOp::ShutDown => 4,
+            TsiRespCtlOp::Rw => 5,
+            TsiRespCtlOp::CreditUpdate => 6,
+            TsiRespCtlOp::CreditRequest => 7,
         }
     }
 }
