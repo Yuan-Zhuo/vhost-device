@@ -25,24 +25,30 @@ use crate::vhu_vsock_thread::*;
 
 pub(crate) type CidMap = HashMap<u64, Arc<VhostUserVsockBackend>>;
 
-const NUM_QUEUES: usize = 2;
+// const NUM_QUEUES: usize = 2;
+const NUM_QUEUES: usize = 4;
 const QUEUE_SIZE: usize = 256;
 
 // New descriptors pending on the rx queue
-const RX_QUEUE_EVENT: u16 = 0;
+const STREAM_RX_QUEUE_EVENT: u16 = 0;
 // New descriptors are pending on the tx queue.
-const TX_QUEUE_EVENT: u16 = 1;
+const STREAM_TX_QUEUE_EVENT: u16 = 1;
+// New descriptors pending on the dgram_rx queue
+const DGRAM_RX_QUEUE_EVENT: u16 = 2;
+// New descriptors are pending on the dgram_tx queue.
+const DGRAM_TX_QUEUE_EVENT: u16 = 3;
+
 // New descriptors are pending on the event queue.
-const EVT_QUEUE_EVENT: u16 = 2;
+const EVT_QUEUE_EVENT: u16 = 4;
 
 /// Notification coming from the backend.
-pub(crate) const BACKEND_EVENT: u16 = 3;
+pub(crate) const BACKEND_EVENT: u16 = 5;
 
 /// Notification coming from the sibling VM.
-pub(crate) const SIBLING_VM_EVENT: u16 = 4;
+pub(crate) const SIBLING_VM_EVENT: u16 = 6;
 
 /// Notification coming from the proxy.
-pub(crate) const PROXY_EVENT: u16 = 5;
+pub(crate) const PROXY_EVENT: u16 = 7;
 
 /// CID of the host
 pub(crate) const VSOCK_HOST_CID: u64 = 2;
@@ -51,7 +57,8 @@ pub(crate) const VSOCK_HOST_CID: u64 = 2;
 pub(crate) const VSOCK_TYPE_STREAM: u16 = 1;
 
 /// Connectionless packet
-pub(crate) const VSOCK_TYPE_DGRAM: u16 = 3;
+pub(crate) const VSOCK_TYPE_TSI_STREAM: u16 = 3;
+pub(crate) const VSOCK_TYPE_TSI_DGRAM: u16 = 5;
 
 /// Vsock packet operation ID
 
@@ -78,7 +85,8 @@ pub(crate) const VSOCK_FLAGS_SHUTDOWN_RCV: u32 = 1;
 pub(crate) const VSOCK_FLAGS_SHUTDOWN_SEND: u32 = 2;
 
 // Queue mask to select vrings.
-const QUEUE_MASK: u64 = 0b11;
+// const QUEUE_MASK: u64 = 0b11;
+const QUEUE_MASK: u64 = 0b1111;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -299,10 +307,17 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
         vrings: &[VringRwLock],
         thread_id: usize,
     ) -> IoResult<bool> {
-        let vring_rx = &vrings[0];
-        let vring_tx = &vrings[1];
+        let vring_stream_rx = &vrings[0];
+        let vring_stream_tx = &vrings[1];
+        let vring_dgram_rx = &vrings[2];
+        let vring_dgram_tx = &vrings[3];
 
-        info!("SNOOPY handle_event: device_event: {} evset {:?}", device_event, evset);
+        info!(
+            "SNOOPY handle_event: device_event: {} evset {:?} vrings {}",
+            device_event,
+            evset,
+            vrings.len()
+        );
 
         if evset != EventSet::IN {
             return Err(Error::HandleEventNotEpollIn.into());
@@ -312,14 +327,18 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
         let evt_idx = thread.event_idx;
 
         match device_event {
-            RX_QUEUE_EVENT => {}
-            TX_QUEUE_EVENT => {
-                thread.process_tx(vring_tx, evt_idx)?;
+            STREAM_RX_QUEUE_EVENT => {}
+            STREAM_TX_QUEUE_EVENT => {
+                thread.process_tx(vring_stream_tx, evt_idx)?;
+            }
+            DGRAM_RX_QUEUE_EVENT => {}
+            DGRAM_TX_QUEUE_EVENT => {
+                thread.process_tx(vring_dgram_tx, evt_idx)?;
             }
             EVT_QUEUE_EVENT => {}
             BACKEND_EVENT => {
                 thread.process_backend_evt(evset);
-                if let Err(e) = thread.process_tx(vring_tx, evt_idx) {
+                if let Err(e) = thread.process_tx(vring_stream_tx, evt_idx) {
                     match e {
                         Error::NoMemoryConfigured => {
                             warn!("Received a backend event before vring initialization")
@@ -330,7 +349,7 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
             }
             SIBLING_VM_EVENT => {
                 let _ = thread.sibling_event_fd.read();
-                thread.process_raw_pkts(vring_rx, evt_idx)?;
+                thread.process_raw_pkts(vring_stream_rx, evt_idx)?;
                 return Ok(false);
             }
             PROXY_EVENT => {
@@ -343,10 +362,13 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
 
         if device_event != EVT_QUEUE_EVENT {
             if thread.thread_backend.pending_rx() {
-                thread.process_rx(vring_rx, evt_idx)?;
+                thread.process_rx(vring_stream_rx, evt_idx)?;
             }
-            if thread.thread_backend.pending_proxy_rx() {
-                thread.process_proxy_rx(vring_rx, evt_idx)?;
+            if thread.thread_backend.pending_proxy_stream_rx() {
+                thread.process_proxy_rx(vring_stream_rx, RxQueueType::ProxyStreamPkts, evt_idx)?;
+            }
+            if thread.thread_backend.pending_proxy_dgram_rx() {
+                thread.process_proxy_rx(vring_dgram_rx, RxQueueType::ProxyDgramPkts, evt_idx)?;
             }
         }
 
@@ -451,11 +473,11 @@ mod tests {
         assert!(exit.is_some());
         exit.unwrap().write(1).unwrap();
 
-        let ret = backend.handle_event(RX_QUEUE_EVENT, EventSet::IN, &vrings, 0);
+        let ret = backend.handle_event(STREAM_RX_QUEUE_EVENT, EventSet::IN, &vrings, 0);
         assert!(ret.is_ok());
         assert!(!ret.unwrap());
 
-        let ret = backend.handle_event(TX_QUEUE_EVENT, EventSet::IN, &vrings, 0);
+        let ret = backend.handle_event(STREAM_TX_QUEUE_EVENT, EventSet::IN, &vrings, 0);
         assert!(ret.is_ok());
         assert!(!ret.unwrap());
 
@@ -527,7 +549,7 @@ mod tests {
 
         assert_eq!(
             backend
-                .handle_event(RX_QUEUE_EVENT, EventSet::OUT, &vrings, 0)
+                .handle_event(STREAM_RX_QUEUE_EVENT, EventSet::OUT, &vrings, 0)
                 .unwrap_err()
                 .to_string(),
             Error::HandleEventNotEpollIn.to_string()

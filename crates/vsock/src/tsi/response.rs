@@ -1,4 +1,4 @@
-use crate::vhu_vsock::{Result, VSOCK_TYPE_DGRAM};
+use crate::vhu_vsock::Result;
 
 use strum::Display;
 use virtio_vsock::packet::VsockPacket;
@@ -74,15 +74,14 @@ pub struct GetPeernameResult {
     pub result: i32,
 }
 
-// SNOOPY-TODO:
-//      pkt.set_type: VSOCK_TYPE_DGRAM or VSOCK_TYPE_STREAM
 pub fn init_proxy_pkt<'a, B: BitmapSlice>(
     id: &ProxyID,
     pkt: &mut VsockPacket<'a, B>,
+    pkt_type: u16,
 ) -> Result<()> {
     pkt.set_src_cid(VSOCK_HOST_CID)
         .set_dst_cid(id.guest_cid)
-        .set_type(VSOCK_TYPE_DGRAM);
+        .set_type(pkt_type);
 
     Ok(())
 }

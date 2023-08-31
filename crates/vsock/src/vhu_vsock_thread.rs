@@ -15,6 +15,7 @@ use std::{
 
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
 use log::warn;
+use strum::Display;
 use vhost_user_backend::{VringEpollHandler, VringRwLock, VringT};
 use virtio_queue::QueueOwnedT;
 use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
@@ -34,18 +35,29 @@ use crate::{
     },
     vhu_vsock::{
         CidMap, ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT, PROXY_EVENT,
-        SIBLING_VM_EVENT, VSOCK_HOST_CID,
+        SIBLING_VM_EVENT, VSOCK_HOST_CID, VSOCK_TYPE_TSI_DGRAM, VSOCK_TYPE_TSI_STREAM,
     },
     vsock_conn::*,
 };
 
 type ArcVhostBknd = Arc<VhostUserVsockBackend>;
 
-#[derive(Debug)]
-enum RxQueueType {
+#[derive(Debug, Clone,Display)]
+pub enum RxQueueType {
     Standard,
     RawPkts,
-    ProxyPkts,
+    ProxyStreamPkts,
+    ProxyDgramPkts,
+}
+
+impl From<RxQueueType> for u16 {
+    fn from(rx_queue_type: RxQueueType) -> Self {
+        match rx_queue_type {
+            RxQueueType::ProxyStreamPkts => VSOCK_TYPE_TSI_STREAM,
+            RxQueueType::ProxyDgramPkts => VSOCK_TYPE_TSI_DGRAM,
+            _ => 0,
+        }
+    }
 }
 
 pub(crate) struct VhostUserVsockThread {
@@ -412,23 +424,26 @@ impl VhostUserVsockThread {
                     .get_mut(&id)
                     .expect("get proxy");
 
-                let recv_msg_resp = match proxy.type_() {
+                match proxy.type_() {
                     ProxyType::Stream => {
                         let fwd_cnt = proxy.fwd_cnt();
-                        TsiResponse::RecvStreamMsg(RecvStreamMsgInfo {
+                        let recv_msg_resp = TsiResponse::RecvStreamMsg(RecvStreamMsgInfo {
                             src_port: id.local_port,
                             dst_port: id.peer_port,
                             fwd_cnt,
-                        })
+                        });
+                        proxy.resp_queue().push_back(recv_msg_resp);
+                        self.thread_backend.proxy_stream_rxq.push_back(id.clone());
                     }
-                    ProxyType::Dgram => TsiResponse::RecvDgramMsg(RecvDgramMsgInfo {
-                        src_port: 0,
-                        dst_port: id.peer_port,
-                    }),
+                    ProxyType::Dgram => {
+                        let recv_msg_resp = TsiResponse::RecvDgramMsg(RecvDgramMsgInfo {
+                            src_port: 0,
+                            dst_port: id.peer_port,
+                        });
+                        proxy.resp_queue().push_back(recv_msg_resp);
+                        self.thread_backend.proxy_dgram_rxq.push_back(id.clone());
+                    }
                 };
-
-                proxy.resp_queue().push_back(recv_msg_resp);
-                self.thread_backend.proxy_rxq.push_back(id.clone());
             }
             ProxyStatus::Listen => {
                 let accept_id = self.thread_backend.accept_proxy(&id).expect("accept proxy");
@@ -445,7 +460,7 @@ impl VhostUserVsockThread {
                 });
 
                 accept_proxy.resp_queue().push_back(op_resp);
-                self.thread_backend.proxy_rxq.push_back(accept_id);
+                self.thread_backend.proxy_stream_rxq.push_back(accept_id);
             }
             ProxyStatus::Idle | ProxyStatus::Closed | ProxyStatus::ReverseInit => unreachable!(),
         };
@@ -564,7 +579,9 @@ impl VhostUserVsockThread {
                     let recv_result = match rx_queue_type {
                         RxQueueType::Standard => self.thread_backend.recv_pkt(&mut pkt),
                         RxQueueType::RawPkts => self.thread_backend.recv_raw_pkt(&mut pkt),
-                        RxQueueType::ProxyPkts => self.thread_backend.recv_proxy_pkt(&mut pkt),
+                        RxQueueType::ProxyStreamPkts | RxQueueType::ProxyDgramPkts => self
+                            .thread_backend
+                            .recv_proxy_pkt(&mut pkt, rx_queue_type.clone()),
                     };
 
                     if recv_result.is_ok() {
@@ -619,8 +636,13 @@ impl VhostUserVsockThread {
                         break;
                     }
                 }
-                RxQueueType::ProxyPkts => {
-                    if !self.thread_backend.pending_proxy_rx() {
+                RxQueueType::ProxyStreamPkts => {
+                    if !self.thread_backend.pending_proxy_stream_rx() {
+                        break;
+                    }
+                }
+                RxQueueType::ProxyDgramPkts => {
+                    if !self.thread_backend.pending_proxy_dgram_rx() {
                         break;
                     }
                 }
@@ -770,8 +792,13 @@ impl VhostUserVsockThread {
     }
 
     /// Wrapper to process proxy packets queues (temporarily ignore event_idx)
-    pub fn process_proxy_rx(&mut self, vring: &VringRwLock, _event_idx: bool) -> Result<bool> {
-        self.process_rx_queue(vring, RxQueueType::ProxyPkts)?;
+    pub fn process_proxy_rx(
+        &mut self,
+        vring: &VringRwLock,
+        rx_queue_type: RxQueueType,
+        _event_idx: bool,
+    ) -> Result<bool> {
+        self.process_rx_queue(vring, rx_queue_type)?;
 
         Ok(true)
     }

@@ -21,13 +21,14 @@ use crate::{
         proxy::{tcp::TcpProxy, udp::UdpProxy, Proxy, ProxyID},
         response::{init_proxy_pkt, AcceptResult, ConnectResult, GetPeernameResult, ListenResult},
         write_be_u32, write_le_i32, write_le_u16, TsiReqCtlOp, TsiRequest, TsiRespCtlOp,
-        TsiResponse, CONN_TX_BUF_SIZE, PROXY_PORT, SOCK_DGRAM, SOCK_STREAM,
+        TsiResponse, CONN_TX_BUF_SIZE, PROXY_PORT, SOCK_DGRAM, SOCK_STREAM, SOCK_TSI_DGRAM,
+        SOCK_TSI_STREAM,
     },
     vhu_vsock::{
         CidMap, ConnMapKey, Error, Result, VSOCK_HOST_CID, VSOCK_OP_REQUEST, VSOCK_OP_RST,
-        VSOCK_TYPE_DGRAM, VSOCK_TYPE_STREAM,
+        VSOCK_TYPE_STREAM, VSOCK_TYPE_TSI_DGRAM, VSOCK_TYPE_TSI_STREAM,
     },
-    vhu_vsock_thread::VhostUserVsockThread,
+    vhu_vsock_thread::{RxQueueType, VhostUserVsockThread},
     vsock_conn::*,
 };
 
@@ -82,8 +83,10 @@ pub(crate) struct VsockThreadBackend {
     pub proxy_fd_map: HashMap<RawFd, ProxyID>,
     /// Maps the port numbers of both parties to a proxy. Used for TSI.
     pub proxy_map: HashMap<ProxyID, Box<dyn Proxy>>,
-    /// Queue of ProxyID objects indicating pending rx operations.
-    pub proxy_rxq: VecDeque<ProxyID>,
+    /// Queue of ProxyID objects indicating pending stream rx operations.
+    pub proxy_stream_rxq: VecDeque<ProxyID>,
+    /// Queue of ProxyID objects indicating pending dgram rx operations.
+    pub proxy_dgram_rxq: VecDeque<ProxyID>,
 }
 
 impl VsockThreadBackend {
@@ -113,7 +116,8 @@ impl VsockThreadBackend {
             raw_pkts_queue: VecDeque::new(),
             proxy_fd_map: HashMap::new(),
             proxy_map: HashMap::new(),
-            proxy_rxq: VecDeque::new(),
+            proxy_stream_rxq: VecDeque::new(),
+            proxy_dgram_rxq: VecDeque::new(),
         }
     }
 
@@ -127,9 +131,14 @@ impl VsockThreadBackend {
         !self.raw_pkts_queue.is_empty()
     }
 
-    /// Checks if there are pending raw vsock packets to be sent to the guest.
-    pub fn pending_proxy_rx(&self) -> bool {
-        !self.proxy_rxq.is_empty()
+    /// Checks if there are pending stream vsock packets to be sent to the guest.
+    pub fn pending_proxy_stream_rx(&self) -> bool {
+        !self.proxy_stream_rxq.is_empty()
+    }
+
+    /// Checks if there are pending dgram vsock packets to be sent to the guest.
+    pub fn pending_proxy_dgram_rx(&self) -> bool {
+        !self.proxy_dgram_rxq.is_empty()
     }
 
     /// Deliver a vsock packet to the guest vsock driver.
@@ -266,18 +275,15 @@ impl VsockThreadBackend {
                     self.backend_rxq.push_back(key);
                 }
             }
-            VSOCK_TYPE_DGRAM => {
+            VSOCK_TYPE_TSI_STREAM | VSOCK_TYPE_TSI_DGRAM => {
                 let tsi_req = pkt.try_into().unwrap();
 
                 info!("SNOOPY tsi_request: {:?}", tsi_req);
 
                 match tsi_req {
                     TsiRequest::PorxyCreate(proxy_create_config) => {
-                        // SNOOPY HACK HERE:
-                        //      For the case of guest as tcp client & host as tcp server, 
-                        //      temporarily ignore proxy_create_config.type_ and directly consider it as TcpProxy.
                         let proxy: Box<dyn Proxy> = match proxy_create_config.type_ {
-                            SOCK_STREAM => Box::new(
+                            SOCK_STREAM | SOCK_TSI_STREAM => Box::new(
                                 TcpProxy::new(
                                     ProxyID::new(
                                         self.guest_cid,
@@ -288,7 +294,7 @@ impl VsockThreadBackend {
                                 )
                                 .map_err(|e| Error::UnixCreate(e.into()))?,
                             ),
-                            SOCK_DGRAM => Box::new(
+                            SOCK_DGRAM | SOCK_TSI_DGRAM => Box::new(
                                 UdpProxy::new(
                                     ProxyID::new(
                                         self.guest_cid,
@@ -338,7 +344,7 @@ impl VsockThreadBackend {
                         proxy
                             .resp_queue()
                             .push_back(TsiResponse::Connect(connect_result));
-                        self.proxy_rxq.push_back(id);
+                        self.proxy_dgram_rxq.push_back(id);
                     }
                     TsiRequest::GetPeername(get_peername_config) => {
                         let id: ProxyID = ProxyID::new(
@@ -363,7 +369,7 @@ impl VsockThreadBackend {
                                 port,
                                 result,
                             }));
-                        self.proxy_rxq.push_back(id);
+                        self.proxy_dgram_rxq.push_back(id);
                     }
                     TsiRequest::SendtoAddr(_) => todo!(),
                     TsiRequest::SendtoData => todo!(),
@@ -397,7 +403,7 @@ impl VsockThreadBackend {
                         proxy
                             .resp_queue()
                             .push_back(TsiResponse::Listen(listen_result));
-                        self.proxy_rxq.push_back(id);
+                        self.proxy_dgram_rxq.push_back(id);
                     }
                     TsiRequest::Accept(accept_config) => {
                         let id: ProxyID =
@@ -414,34 +420,41 @@ impl VsockThreadBackend {
                                     dst_port: control_port,
                                     result,
                                 }));
-                            self.proxy_rxq.push_back(id);
+                            self.proxy_dgram_rxq.push_back(id);
                         }
                     }
                     TsiRequest::SendMsg(send_msg_config) => {
-                        // SNOOPY HACK HERE:
-                        //     At present, we cannot distinguish whether the Msg belongs to stream or dgram from the request.
-                        //     Therefore, we first treat as TCP and then UDP.
-                        //     The order is because if there is a TCP proxy with ID peer_port+local_port,
-                        //     then there must be a listening TCP proxy with ID peer_port+PROXY_PORT.
-                        // treat as TCP first
-                        let mut id: ProxyID = ProxyID::new(
-                            self.guest_cid,
-                            send_msg_config.peer_port,
-                            send_msg_config.local_port,
-                        );
+                        match pkt.type_() {
+                            VSOCK_TYPE_TSI_STREAM => {
+                                let id: ProxyID = ProxyID::new(
+                                    self.guest_cid,
+                                    send_msg_config.peer_port,
+                                    send_msg_config.local_port,
+                                );
 
-                        let proxy = match self.proxy_map.get_mut(&id) {
-                            Some(proxy) => proxy,
-                            None => {
-                                // treat as UDP then
-                                id.local_port = PROXY_PORT;
-                                self.proxy_map.get_mut(&id).ok_or(Error::ProxyNotFound)?
+                                let proxy =
+                                    self.proxy_map.get_mut(&id).ok_or(Error::ProxyNotFound)?;
+
+                                if proxy.send(send_msg_config).map_err(|_| Error::UnixWrite)? {
+                                    self.proxy_stream_rxq.push_back(id);
+                                }
                             }
-                        };
+                            VSOCK_TYPE_TSI_DGRAM => {
+                                let id: ProxyID = ProxyID::new(
+                                    self.guest_cid,
+                                    send_msg_config.peer_port,
+                                    PROXY_PORT,
+                                );
 
-                        if proxy.send(send_msg_config).map_err(|_| Error::UnixWrite)? {
-                            self.proxy_rxq.push_back(id);
-                        }
+                                let proxy =
+                                    self.proxy_map.get_mut(&id).ok_or(Error::ProxyNotFound)?;
+
+                                if proxy.send(send_msg_config).map_err(|_| Error::UnixWrite)? {
+                                    self.proxy_dgram_rxq.push_back(id);
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
                     }
                     TsiRequest::ProxyRelease(proxy_release_config) => {
                         let id: ProxyID = ProxyID::new(
@@ -484,7 +497,7 @@ impl VsockThreadBackend {
                         proxy
                             .resp_queue()
                             .push_back(TsiResponse::Accept(accept_result));
-                        self.proxy_rxq.push_back(id);
+                        self.proxy_dgram_rxq.push_back(id);
                     }
                 }
             }
@@ -516,11 +529,25 @@ impl VsockThreadBackend {
         Ok(())
     }
 
-    pub fn recv_proxy_pkt<B: BitmapSlice>(&mut self, pkt: &mut VsockPacket<B>) -> Result<()> {
-        let id = self.proxy_rxq.pop_front().ok_or(Error::EmptyProxyIDQueue)?;
+    pub fn recv_proxy_pkt<B: BitmapSlice>(
+        &mut self,
+        pkt: &mut VsockPacket<B>,
+        rx_queue_type: RxQueueType,
+    ) -> Result<()> {
+        let id = match rx_queue_type {
+            RxQueueType::ProxyStreamPkts => self
+                .proxy_stream_rxq
+                .pop_front()
+                .ok_or(Error::EmptyProxyIDQueue)?,
+            RxQueueType::ProxyDgramPkts => self
+                .proxy_dgram_rxq
+                .pop_front()
+                .ok_or(Error::EmptyProxyIDQueue)?,
+            _ => unreachable!(),
+        };
         let proxy = self.proxy_map.get_mut(&id).ok_or(Error::ProxyNotFound)?;
 
-        init_proxy_pkt(&id, pkt)?;
+        init_proxy_pkt(&id, pkt, rx_queue_type.clone().into())?;
 
         let data_slice = pkt.data_slice().ok_or(Error::PktBufMissing)?;
 
@@ -531,7 +558,7 @@ impl VsockThreadBackend {
 
         let mut pkt_len = 0;
 
-        info!("SNOOPY tsi_response: {:?}", tsi_resp);
+        info!("SNOOPY tsi_response: {} {:?}", rx_queue_type, tsi_resp);
 
         match tsi_resp {
             TsiResponse::Connect(connect_result) => {

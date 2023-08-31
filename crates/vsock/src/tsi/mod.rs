@@ -6,19 +6,22 @@ mod utils;
 
 pub use request::TsiRequest;
 pub use response::TsiResponse;
+use strum::Display;
 pub use utils::{write_be_u32, write_le_i32, write_le_u16};
 
 pub const VSOCK_HOST_CID: u64 = 2;
 
 pub const SOCK_STREAM: u16 = 1;
 pub const SOCK_DGRAM: u16 = 2;
+pub const SOCK_TSI_STREAM: u16 = 7;
+pub const SOCK_TSI_DGRAM: u16 = 8;
 
 pub const PROXY_PORT: u32 = 620;
 
 pub const CONN_TX_BUF_SIZE: u32 = 8 << 20;
 
 /// Reserved ports indicating the operation type
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Display, Debug)]
 pub enum TsiReqCtlOp {
     ProxyCreate = 1024,
     Connect,
